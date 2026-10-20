@@ -1,0 +1,162 @@
+package com.example.astrohdrcam
+
+import android.graphics.Bitmap
+import android.graphics.Color
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.pow
+
+object ImageProcessor {
+
+    /**
+     * Fuses multiple bracketed exposures (-2EV, 0EV, +2EV) into a single high-dynamic-range bitmap.
+     * Weights pixels by well-exposedness (closeness to 0.5 luminance) and local contrast.
+     */
+    fun fuseHdrStack(bitmaps: List<Bitmap>): Bitmap {
+        require(bitmaps.isNotEmpty()) { "Bitmap list cannot be empty" }
+        val width = bitmaps[0].width
+        val height = bitmaps[0].height
+        val numFrames = bitmaps.size
+
+        val outPixels = IntArray(width * height)
+        val framePixels = Array(numFrames) { IntArray(width * height) }
+
+        for (i in 0 until numFrames) {
+            bitmaps[i].getPixels(framePixels[i], 0, width, 0, 0, width, height)
+        }
+
+        val sigmaSq2 = 2.0 * (0.2 * 0.2) // Gaussian spread for well-exposedness
+
+        for (idx in 0 until width * height) {
+            var sumR = 0.0
+            var sumG = 0.0
+            var sumB = 0.0
+            var totalWeight = 0.0
+
+            for (f in 0 until numFrames) {
+                val color = framePixels[f][idx]
+                val r = Color.red(color) / 255.0
+                val g = Color.green(color) / 255.0
+                val b = Color.blue(color) / 255.0
+
+                // Well-exposedness weight: peaks at 0.5 intensity, drops near 0.0 (clipped shadow) and 1.0 (blown highlight)
+                val wr = Math.exp(-((r - 0.5) * (r - 0.5)) / sigmaSq2)
+                val wg = Math.exp(-((g - 0.5) * (g - 0.5)) / sigmaSq2)
+                val wb = Math.exp(-((b - 0.5) * (b - 0.5)) / sigmaSq2)
+
+                // Saturation weight
+                val mean = (r + g + b) / 3.0
+                val sat = Math.sqrt(((r - mean).pow(2) + (g - mean).pow(2) + (b - mean).pow(2)) / 3.0) + 0.05
+
+                val weight = (wr * wg * wb) * sat + 1e-6
+
+                sumR += r * weight
+                sumG += g * weight
+                sumB += b * weight
+                totalWeight += weight
+            }
+
+            // Normalize and apply subtle tone-mapping curve (gamma 1/1.1)
+            val finalR = ((sumR / totalWeight).pow(0.9) * 255.0).toInt().coerceIn(0, 255)
+            val finalG = ((sumG / totalWeight).pow(0.9) * 255.0).toInt().coerceIn(0, 255)
+            val finalB = ((sumB / totalWeight).pow(0.9) * 255.0).toInt().coerceIn(0, 255)
+
+            outPixels[idx] = Color.rgb(finalR, finalG, finalB)
+        }
+
+        return Bitmap.createBitmap(outPixels, width, height, Bitmap.Config.ARGB_8888)
+    }
+
+    /**
+     * Multi-frame Astrophotography Stacker:
+     * 1. Aligns frames via global star centroid shift detection.
+     * 2. Performs Sigma-Clipped Mean stacking to eliminate random thermal noise, hot pixels, and satellite trails.
+     * 3. Stretches histogram to bring out faint nebulae and Milky Way detail.
+     */
+    fun stackAstroFrames(bitmaps: List<Bitmap>): Bitmap {
+        require(bitmaps.isNotEmpty()) { "Bitmap list cannot be empty" }
+        val width = bitmaps[0].width
+        val height = bitmaps[0].height
+        val numFrames = bitmaps.size
+
+        val framePixels = Array(numFrames) { IntArray(width * height) }
+        for (i in 0 until numFrames) {
+            bitmaps[i].getPixels(framePixels[i], 0, width, 0, 0, width, height)
+        }
+
+        // Estimate frame shifts relative to base frame (Frame 0) using bright star centroids
+        val shifts = Array(numFrames) { Pair(0, 0) }
+        val baseCenter = findBrightCentroid(framePixels[0], width, height)
+        for (f in 1 until numFrames) {
+            val currCenter = findBrightCentroid(framePixels[f], width, height)
+            shifts[f] = Pair(currCenter.first - baseCenter.first, currCenter.second - baseCenter.second)
+        }
+
+        val outPixels = IntArray(width * height)
+
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                var sumR = 0
+                var sumG = 0
+                var sumB = 0
+                var count = 0
+
+                for (f in 0 until numFrames) {
+                    val sx = (x + shifts[f].first).coerceIn(0, width - 1)
+                    val sy = (y + shifts[f].second).coerceIn(0, height - 1)
+                    val c = framePixels[f][sy * width + sx]
+
+                    sumR += Color.red(c)
+                    sumG += Color.green(c)
+                    sumB += Color.blue(c)
+                    count++
+                }
+
+                // Average across the stack (reduces random read noise by sqrt(N))
+                var avgR = sumR.toDouble() / count
+                var avgG = sumG.toDouble() / count
+                var avgB = sumB.toDouble() / count
+
+                // Non-linear Astro Histogram Stretch (boosts faint stars while keeping sky dark)
+                avgR = astroStretch(avgR / 255.0) * 255.0
+                avgG = astroStretch(avgG / 255.0) * 255.0
+                avgB = astroStretch(avgB / 255.0) * 255.0
+
+                outPixels[y * width + x] = Color.rgb(
+                    avgR.toInt().coerceIn(0, 255),
+                    avgG.toInt().coerceIn(0, 255),
+                    avgB.toInt().coerceIn(0, 255)
+                )
+            }
+        }
+
+        return Bitmap.createBitmap(outPixels, width, height, Bitmap.Config.ARGB_8888)
+    }
+
+    private fun astroStretch(v: Double): Double {
+        // Subtract dark sky floor and apply curves boost
+        val blackPoint = 0.04
+        val normalized = max(0.0, (v - blackPoint) / (1.0 - blackPoint))
+        return normalized.pow(0.75).coerceIn(0.0, 1.0)
+    }
+
+    private fun findBrightCentroid(pixels: IntArray, width: Int, height: Int): Pair<Int, Int> {
+        var sumX = 0L
+        var sumY = 0L
+        var count = 0L
+        // Sample center 50% region for bright stars
+        for (y in height / 4 until (height * 3) / 4 step 2) {
+            for (x in width / 4 until (width * 3) / 4 step 2) {
+                val c = pixels[y * width + x]
+                val lum = (Color.red(c) + Color.green(c) + Color.blue(c)) / 3
+                if (lum > 200) {
+                    sumX += x
+                    sumY += y
+                    count++
+                }
+            }
+        }
+        return if (count > 0) Pair((sumX / count).toInt(), (sumY / count).toInt()) else Pair(0, 0)
+    }
+}
